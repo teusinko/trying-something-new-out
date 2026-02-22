@@ -102,6 +102,10 @@ def fetch_rankings(url: str, timeout_s: int) -> list[RankingEntry]:
     return entries
 
 
+def normalize_entries(entries: Iterable[RankingEntry]) -> str:
+    return "\n".join(f"{entry.position}|{entry.name}|{entry.points}" for entry in entries)
+
+
 def build_report(entries: Iterable[RankingEntry], source_url: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [f"Ranking snapshot ({timestamp})", f"Source: {source_url}", ""]
@@ -130,6 +134,12 @@ def post_to_webhook(webhook_url: str, message: str, timeout_s: int) -> None:
 def post_to_stdout(message: str) -> None:
     print(message)
     print("-" * 72)
+
+
+def save_report(path: str, message: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(message)
+        f.write("\n")
 
 
 def save_state(state_path: str, state: dict[str, str]) -> None:
@@ -168,6 +178,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to store the last posted snapshot hash.",
     )
     parser.add_argument(
+        "--output-file",
+        default="ranking_latest.txt",
+        help="Path to always write the latest parsed ranking snapshot.",
+    )
+    parser.add_argument(
         "--webhook-url",
         default=os.getenv("WEBHOOK_URL"),
         help="Webhook URL to post updates (optional, defaults to WEBHOOK_URL env var).",
@@ -194,15 +209,19 @@ def main() -> int:
     state = load_state(args.state_file)
     last_hash = state.get("last_hash")
 
-    print(f"Starting ranking watcher. Polling every {args.interval} seconds.")
-    print(f"Source URL: {args.url}")
-    print("Posting destination:", "webhook" if args.webhook_url else "stdout")
+    print(f"Starting ranking watcher. Polling every {args.interval} seconds.", flush=True)
+    print(f"Source URL: {args.url}", flush=True)
+    print("Posting destination:", "webhook" if args.webhook_url else "stdout", flush=True)
+    print(f"Latest ranking snapshot file: {args.output_file}", flush=True)
 
     while True:
         try:
             entries = fetch_rankings(args.url, timeout_s=args.timeout)
+            normalized = normalize_entries(entries)
             report = build_report(entries, args.url)
-            current_hash = content_hash(report)
+            current_hash = content_hash(normalized)
+
+            save_report(args.output_file, report)
 
             if args.always_post or current_hash != last_hash:
                 if args.webhook_url:
@@ -210,10 +229,11 @@ def main() -> int:
                 else:
                     post_to_stdout(report)
 
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] Posted updated ranking.")
                 last_hash = current_hash
                 save_state(args.state_file, {"last_hash": last_hash})
             else:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] No changes detected.")
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] No ranking changes detected.")
 
         except Exception as exc:
             print(f"[{datetime.now().isoformat(timespec='seconds')}] Error: {exc}", file=sys.stderr)
