@@ -7,12 +7,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -74,6 +75,27 @@ class RankingTableParser(HTMLParser):
             self.in_table = False
 
 
+class ScriptContentParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_script = False
+        self.scripts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "script":
+            self.in_script = True
+
+    def handle_data(self, data: str) -> None:
+        if self.in_script:
+            cleaned = data.strip()
+            if cleaned:
+                self.scripts.append(cleaned)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self.in_script = False
+
+
 def fetch_html(url: str, timeout_s: int) -> str:
     request = Request(url, headers={"User-Agent": "ranking-watcher/1.0"})
     with urlopen(request, timeout=timeout_s) as response:
@@ -81,12 +103,7 @@ def fetch_html(url: str, timeout_s: int) -> str:
         return response.read().decode(charset, errors="replace")
 
 
-def fetch_rankings(url: str, timeout_s: int) -> list[RankingEntry]:
-    try:
-        html = fetch_html(url, timeout_s)
-    except (HTTPError, URLError) as exc:
-        raise RuntimeError(f"Could not fetch rankings page: {exc}") from exc
-
+def parse_rankings_from_table(html: str) -> list[RankingEntry]:
     parser = RankingTableParser()
     parser.feed(html)
 
@@ -96,10 +113,141 @@ def fetch_rankings(url: str, timeout_s: int) -> list[RankingEntry]:
             continue
         entries.append(RankingEntry(position=row[0], name=row[1], points=row[2]))
 
-    if not entries:
-        raise RuntimeError("No ranking rows were parsed from the rankings table.")
-
     return entries
+
+
+def parse_rankings_from_embedded_json(html: str) -> list[RankingEntry]:
+    script_parser = ScriptContentParser()
+    script_parser.feed(html)
+
+    candidates: list[RankingEntry] = []
+
+    for script_content in script_parser.scripts:
+        for payload in extract_json_payloads(script_content):
+            candidates.extend(extract_entries_from_json(payload))
+
+    deduped: list[RankingEntry] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in candidates:
+        key = (entry.position, entry.name, entry.points)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+
+    return deduped
+
+
+def extract_json_payloads(script_content: str) -> list[Any]:
+    payloads: list[Any] = []
+
+    script_content = script_content.strip().rstrip(";")
+
+    direct_candidates = [script_content]
+    assign_match = re.search(r"=\s*(\{.*\}|\[.*\])\s*$", script_content, flags=re.DOTALL)
+    if assign_match:
+        direct_candidates.append(assign_match.group(1))
+
+    for candidate in direct_candidates:
+        parsed = try_parse_json(candidate)
+        if parsed is not None:
+            payloads.append(parsed)
+
+    for match in re.finditer(r"(\{[\s\S]*\}|\[[\s\S]*\])", script_content):
+        parsed = try_parse_json(match.group(1))
+        if parsed is not None:
+            payloads.append(parsed)
+
+    return payloads
+
+
+def try_parse_json(value: str) -> Any | None:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_entries_from_json(payload: Any) -> list[RankingEntry]:
+    results: list[RankingEntry] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            if node and all(isinstance(item, dict) for item in node):
+                maybe_entries = try_convert_dict_list_to_entries(node)
+                if maybe_entries:
+                    results.extend(maybe_entries)
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            maybe_entries = try_convert_dict_list_to_entries(node.get("data") if "data" in node else None)
+            if maybe_entries:
+                results.extend(maybe_entries)
+            for value in node.values():
+                walk(value)
+
+    walk(payload)
+    return results
+
+
+def try_convert_dict_list_to_entries(node: Any) -> list[RankingEntry] | None:
+    if not isinstance(node, list) or not node:
+        return None
+    if not all(isinstance(item, dict) for item in node):
+        return None
+
+    entries: list[RankingEntry] = []
+    for item in node:
+        name = first_present(item, ["name", "driverName", "driver", "participant", "teamName", "fullName"])
+        points = first_present(item, ["points", "point", "score", "totalPoints", "pts"])
+        position = first_present(item, ["position", "rank", "place", "ranking"])
+
+        if name is None or points is None:
+            continue
+
+        if position is None:
+            position = str(len(entries) + 1)
+
+        entries.append(
+            RankingEntry(
+                position=str(position).strip(),
+                name=str(name).strip(),
+                points=str(points).strip(),
+            )
+        )
+
+    return entries or None
+
+
+def first_present(item: dict[str, Any], keys: list[str]) -> Any | None:
+    for key in keys:
+        if key in item and item[key] not in (None, ""):
+            return item[key]
+    return None
+
+
+def fetch_rankings(url: str, timeout_s: int, debug_html_file: str | None = None) -> list[RankingEntry]:
+    try:
+        html = fetch_html(url, timeout_s)
+    except (HTTPError, URLError) as exc:
+        raise RuntimeError(f"Could not fetch rankings page: {exc}") from exc
+
+    if debug_html_file:
+        with open(debug_html_file, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    entries = parse_rankings_from_table(html)
+    if entries:
+        return entries
+
+    entries = parse_rankings_from_embedded_json(html)
+    if entries:
+        return entries
+
+    raise RuntimeError(
+        "No ranking rows were parsed. The page may now use a different structure/API. "
+        "Try --always-post with --output-file and inspect raw page/source."
+    )
 
 
 def normalize_entries(entries: Iterable[RankingEntry]) -> str:
@@ -197,6 +345,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a single polling cycle and exit (useful for testing).",
     )
+    parser.add_argument(
+        "--debug-html-file",
+        default=None,
+        help="Optional path to write fetched page HTML for troubleshooting parsing.",
+    )
     return parser.parse_args()
 
 
@@ -216,7 +369,7 @@ def main() -> int:
 
     while True:
         try:
-            entries = fetch_rankings(args.url, timeout_s=args.timeout)
+            entries = fetch_rankings(args.url, timeout_s=args.timeout, debug_html_file=args.debug_html_file)
             normalized = normalize_entries(entries)
             report = build_report(entries, args.url)
             current_hash = content_hash(normalized)

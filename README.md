@@ -40,9 +40,21 @@ WEBHOOK_URL="https://your-webhook.example" python3 ranking_watcher.py --interval
 - `--output-file ranking_latest.txt` controls where latest parsed ranking is stored.
 - `--timeout 20` sets request timeout.
 - `--run-once` fetches one snapshot and exits.
+- `--debug-html-file page.html` saves the fetched HTML so you can inspect why parsing failed.
 
 ## Example: run in background (Linux)
 
 ```bash
 nohup python3 ranking_watcher.py --interval 300 > watcher.log 2>&1 &
 ```
+
+## Troubleshooting
+
+If you see `No ranking rows were parsed`, the page likely changed structure or is script-rendered differently.
+Run once with HTML capture and inspect the saved file:
+
+```bash
+python3 ranking_watcher.py --run-once --debug-html-file page_dump.html
+```
+
+Then share `page_dump.html` and the parser can be adjusted quickly.
